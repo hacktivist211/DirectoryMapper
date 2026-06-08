@@ -8,6 +8,7 @@ import ast
 import re
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 SUPPORTED_CODE_EXTENSIONS = {'.py', '.js', '.ts', '.java', '.c', '.cpp', '.h', '.cs', '.go', '.rb', '.php'}
 SUPPORTED_DOCS_EXTENSIONS = {'.md', '.txt'}
@@ -120,6 +121,18 @@ def should_ignore(path, ignore_patterns):
             return True
     return False
 
+
+def fetch_file_content_worker(entry_path, mod_time, cache, use_cache):
+    """Parallel worker task specifically capturing disk I/O summary pipelines."""
+    try:
+        with open(entry_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content_lines = f.readlines(8192)
+        summary = get_intelligent_summary(entry_path, content_lines)
+        return summary
+    except Exception:
+        return {"error": "Could not read or parse file."}
+
+
 def map_directory(root_path, args, cache):
     base_ignore = {".git", ".vscode", "__pycache__", "node_modules", "venv"}
     gitignore_patterns = load_gitignore_patterns(root_path) if args.use_gitignore else []
@@ -145,7 +158,12 @@ def map_directory(root_path, args, cache):
     progress = ProgressBar(len(paths_to_process), "Mapping directory")
 
     node_stack = [(tree, root_path, 0)]
+    content_tasks = []
     
+    # Thread pool specialized for external I/O pipeline overlaps
+    # For slow external drives, 8-16 workers helps mask interface bottlenecks
+    executor = ThreadPoolExecutor(max_workers=12)
+
     while node_stack:
         parent_node, current_path, depth = node_stack.pop()
         
@@ -186,19 +204,21 @@ def map_directory(root_path, args, cache):
                     if args.no_content:
                         file_node["summary"] = "Content omitted by user."
                     else:
-                        try:
-                            with open(entry_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                content_lines = f.readlines(8192)
-                            summary = get_intelligent_summary(entry_path, content_lines)
-                            file_node["summary"] = summary
-                        except Exception:
-                            file_node["summary"] = {"error": "Could not read or parse file."}
+                        # Schedule file parsing asynchronously to hide disk read overhead
+                        future = executor.submit(fetch_file_content_worker, entry_path, mod_time, cache, args.use_cache)
+                        content_tasks.append((future, file_node, entry_path, mod_time))
             
-            if args.use_cache:
-                cache[str(entry_path)] = {"mtime": mod_time, "node": file_node}
-
             parent_node["children"].append(file_node)
-    
+            
+    # Resolve background content tasks back into structural nodes
+    for future, file_node, entry_path, mod_time in content_tasks:
+        summary = future.result()
+        file_node["summary"] = summary
+        
+        if args.use_cache:
+            cache[str(entry_path)] = {"mtime": mod_time, "node": file_node}
+            
+    executor.shutdown(wait=True)
     progress.complete()
     return tree, stats
 
@@ -218,7 +238,7 @@ def generate_text_output(node, prefix="", is_last=True):
         line += f" ({size_str})"
         lines.append(line)
         summary = node.get('summary', {})
-        if summary:
+        if summary and isinstance(summary, dict):
             summary_prefix = prefix + ("    " if is_last else "│   ")
             if 'error' in summary:
                  lines.append(f"{summary_prefix}  [!] {summary['error']}")
@@ -228,6 +248,9 @@ def generate_text_output(node, prefix="", is_last=True):
                 for definition in summary['definitions'][:3]: lines.append(f"{summary_prefix}  > {definition}")
             if 'local_imports' in summary and summary['local_imports']:
                 lines.append(f"{summary_prefix}  Imports: {', '.join(summary['local_imports'])}")
+        elif isinstance(summary, str):
+            summary_prefix = prefix + ("    " if is_last else "│   ")
+            lines.append(f"{summary_prefix}  {summary}")
 
     return lines
 
@@ -342,4 +365,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
